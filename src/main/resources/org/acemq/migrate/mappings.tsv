@@ -1,0 +1,59 @@
+# What maps to what: Spring AMQP, the RabbitMQ Java client and JMS onto AceMQ.
+#
+# One row per source API. Tab-separated columns:
+#   id       stable name of the row, used in the report and the JSON
+#   source   spring-amqp | rabbitmq-client | jms
+#   kind     import (matched against import lines) | usage (matched against code, only in a
+#            file that imports from the source's packages)
+#   pattern  a Java regular expression
+#   step     where it falls in the migration order (1-8, see Steps in Report.java)
+#   risk     low | medium | high
+#   acemq    the AceMQ equivalent; "none:" means there is no direct one and says what to do
+#   note     what to watch for
+#
+# Deterministic on purpose: the model is asked only about what this table leaves to judgment.
+spring-connection-factory	spring-amqp	import	^org\.springframework\.amqp\.rabbit\.connection\.(Caching)?ConnectionFactory$	1	low	ConnectionConfig + AceMq.connect(config), or the starter's acemq.url	One AceMq per application; it owns its channels, recovery and publisher confirms.
+spring-rabbit-template	spring-amqp	import	^org\.springframework\.amqp\.rabbit\.core\.RabbitTemplate$	3	medium	mq.publisher(exchange, routingKey) -> Publisher.send(payload)	Publishes are confirmed and mandatory by default; an unroutable send fails instead of vanishing.
+spring-amqp-template	spring-amqp	import	^org\.springframework\.amqp\.core\.AmqpTemplate$	3	medium	mq.publisher(exchange, routingKey) -> Publisher.send(payload)	As RabbitTemplate.
+spring-convert-and-send	spring-amqp	usage	\.convertAndSend\s*\(	3	medium	Publisher.send(payload[, Envelope])	A MessagePostProcessor that sets headers becomes Envelope.header(...).
+spring-send-and-receive	spring-amqp	usage	\.(convertSendAndReceive|sendAndReceive)\s*\(	6	medium	mq.requester().request(exchange, routingKey, request, Reply.class, timeout)	Replies use direct reply-to; a reply the caller cannot decode fails at once.
+spring-receive	spring-amqp	usage	\.(receiveAndConvert|receive)\s*\(	4	high	none: AceMQ has no polling get; consume the queue (mq.consume) instead	A polling loop becomes a push consumer; check what drove the poll rate.
+spring-rabbit-listener	spring-amqp	usage	@RabbitListener\b	4	medium	@AceListener(queue = ...) (starter) or mq.consume(queue, Type.class, options, handler)	concurrency and prefetch become @AceListener(concurrency, prefetch).
+spring-rabbit-handler	spring-amqp	usage	@RabbitHandler\b	4	high	none: one handler per payload type; dispatch on type inside one AceListener	Multi-method listeners that dispatch on payload class need a small switch.
+spring-listener-container	spring-amqp	import	^org\.springframework\.amqp\.rabbit\.listener\.(SimpleMessageListenerContainer|DirectMessageListenerContainer)$	4	medium	mq.consume(queue, Type.class, ConsumerOptions.prefetch(n), handler) or mq.consumeGroup(...)	Container concurrency becomes consumeGroup(...).concurrency(n).
+spring-listener-factory	spring-amqp	import	^org\.springframework\.amqp\.rabbit\.config\.SimpleRabbitListenerContainerFactory$	4	low	acemq.* starter properties (prefetch, retry ladder)	Factory-wide settings move to configuration.
+spring-message-listener	spring-amqp	import	^org\.springframework\.amqp\.core\.(MessageListener|ChannelAwareMessageListener)$	4	medium	MessageHandler<T> (or AckAwareHandler<T> for manual acks)	Manual channel acks map to AckAwareHandler; most code can drop them.
+spring-declarables	spring-amqp	import	^org\.springframework\.amqp\.core\.(Queue|QueueBuilder|TopicExchange|DirectExchange|FanoutExchange|HeadersExchange|ExchangeBuilder|Binding|BindingBuilder|Declarables)$	2	low	Topology.define()...build() applied with mq.topology().apply(...)	queueWithDeadLetter(name) declares the queue with its .dlq and .parked.
+spring-rabbit-admin	spring-amqp	import	^org\.springframework\.amqp\.rabbit\.core\.RabbitAdmin$	2	low	mq.topology() (TopologyPlanner): plan, then apply	Plans show drift before anything changes.
+spring-retry-interceptor	spring-amqp	import	^org\.springframework\.amqp\.rabbit\.(config\.RetryInterceptorBuilder|retry\.RepublishMessageRecoverer|retry\.RejectAndDontRequeueRecoverer)$	5	medium	ConsumerOptions.withRetry(RetryPolicy...) and the {queue}.dlq dead-letter queue	Retries move from in-memory sleeps to broker delay queues; nothing sleeps in the consumer thread.
+spring-amqp-reject	spring-amqp	import	^org\.springframework\.amqp\.(AmqpRejectAndDontRequeueException|ImmediateAcknowledgeAmqpException)$	5	low	throw AceFatalException (dead-letter now) / AceRetryableException (retry)	Same intent, explicit names.
+spring-message-converter	spring-amqp	import	^org\.springframework\.amqp\.support\.converter\.\w+$	3	medium	Codec (JsonCodec by default; Avro, Protobuf, XML, YAML, TOML codecs)	Check the content type other services send; Jackson2JsonMessageConverter maps to JsonCodec.
+spring-tx	spring-amqp	usage	\b(setChannelTransacted|RabbitTransactionManager)\b	7	high	none: use the outbox (OutboxRecord + OutboxRelay) for publish-with-database	AMQP transactions are slow and do not span the database; the outbox does.
+spring-confirm-callback	spring-amqp	usage	\b(setConfirmCallback|setReturnsCallback|setReturnCallback|setMandatory)\b	3	low	nothing to write: confirms and mandatory are on by default; Publisher.send fails with PublishFailedException	Delete the callbacks; handle the exception where the send is.
+spring-boot-starter	spring-amqp	import	^org\.springframework\.boot\.autoconfigure\.amqp\.\w+$	1	low	acemq-java-amqp-spring-boot-starter (acemq.* properties)	spring.rabbitmq.* properties become acemq.*.
+rabbit-connection-factory	rabbitmq-client	import	^com\.rabbitmq\.client\.ConnectionFactory$	1	low	ConnectionConfig.url(...) + AceMq.connect(config)	TLS, credentials and recovery are ConnectionConfig settings.
+rabbit-connection	rabbitmq-client	import	^com\.rabbitmq\.client\.(Connection|Channel)$	1	medium	AceMq (one per application); channels are managed for you	Code that shares a Channel across threads is a bug today and goes away.
+rabbit-recovery	rabbitmq-client	usage	\b(setAutomaticRecoveryEnabled|setTopologyRecoveryEnabled|setNetworkRecoveryInterval|RecoveryListener)\b	1	low	built in: AceMq recovers connections, channels, consumers and topology	Delete it; recovery is on and tested by the chaos drills.
+rabbit-declare	rabbitmq-client	usage	\b(queueDeclare|exchangeDeclare|queueBind|exchangeBind)\s*\(	2	low	Topology.define()...build() + mq.topology().apply(...)	Arguments such as x-queue-type become QueueSpec settings.
+rabbit-publish	rabbitmq-client	usage	\bbasicPublish\s*\(	3	medium	mq.publisher(exchange, routingKey).send(payload)	Bytes in, bytes out becomes typed payloads through a Codec.
+rabbit-confirms	rabbitmq-client	usage	\b(confirmSelect|waitForConfirms|waitForConfirmsOrDie|addConfirmListener)\b	3	low	nothing to write: every publish is confirmed; send() returns once the broker has it	Async confirm bookkeeping can be deleted.
+rabbit-return	rabbitmq-client	usage	\b(addReturnListener|ReturnListener|ReturnCallback)\b	3	low	PublishFailedException (unroutable) from send()	Mandatory is the default.
+rabbit-consume	rabbitmq-client	usage	\b(basicConsume|DefaultConsumer|DeliverCallback)\b	4	medium	mq.consume(queue, Type.class, options, handler)	Ack after the handler returns; a throw goes to the retry ladder.
+rabbit-qos	rabbitmq-client	usage	\bbasicQos\s*\(	4	low	ConsumerOptions.prefetch(n)
+rabbit-ack	rabbitmq-client	usage	\b(basicAck|basicNack|basicReject)\s*\(	5	medium	handler return = ack; AceRetryableException = retry; AceFatalException = dead-letter	requeue=true loops on a poison message today; AceMQ retries with delays, then dead-letters.
+rabbit-get	rabbitmq-client	usage	\bbasicGet\s*\(	4	high	none: consume the queue instead of polling it	A basic.get loop has no prefetch and no back-pressure.
+rabbit-tx	rabbitmq-client	usage	\b(txSelect|txCommit|txRollback)\s*\(	7	high	none: use the outbox (OutboxRecord + OutboxRelay)
+rabbit-rpc	rabbitmq-client	usage	\b(RpcClient|RpcServer|replyTo\s*\(|amq\.rabbitmq\.reply-to)	6	medium	mq.requester() / mq.respond(queue, Request.class, fn)
+rabbit-stream	rabbitmq-client	usage	x-stream-offset|"stream"	4	medium	mq.declareStream(...) and mq.stream(queue, Type.class) (StreamReader)	Offsets are tracked by the reader.
+jms-connection-factory	jms	import	^(javax|jakarta)\.jms\.(ConnectionFactory|QueueConnectionFactory|TopicConnectionFactory)$	1	medium	ConnectionConfig + AceMq.connect(config)	JNDI lookups go; configuration names the broker.
+jms-session	jms	import	^(javax|jakarta)\.jms\.(Connection|Session|JMSContext|QueueSession|TopicSession)$	1	medium	AceMq
+jms-producer	jms	import	^(javax|jakarta)\.jms\.(MessageProducer|JMSProducer|QueueSender|TopicPublisher)$	3	medium	mq.publisher(exchange, routingKey).send(payload)	A JMS queue is an AMQP queue on the default exchange; a topic becomes a topic exchange.
+jms-consumer	jms	import	^(javax|jakarta)\.jms\.(MessageConsumer|JMSConsumer|QueueReceiver|TopicSubscriber|MessageListener)$	4	medium	mq.consume(queue, Type.class, options, handler)
+jms-listener	jms	usage	@JmsListener\b	4	medium	@AceListener(queue = ...) (starter)
+jms-template	jms	import	^org\.springframework\.jms\.core\.JmsTemplate$	3	medium	mq.publisher(...) for sends; mq.consume(...) for receives
+jms-message-types	jms	import	^(javax|jakarta)\.jms\.(TextMessage|ObjectMessage|BytesMessage|MapMessage|StreamMessage)$	3	medium	typed payloads through a Codec (JsonCodec by default)	ObjectMessage (Java serialization) has no equivalent on purpose; pick a schema.
+jms-selector	jms	usage	\bcreate(Durable)?Consumer\s*\(.*,\s*"|messageSelector	4	high	none: route with a headers or topic exchange binding instead of a selector	Selectors filter on the consumer; AMQP routes on the broker.
+jms-transacted	jms	usage	\b(SESSION_TRANSACTED|createSession\s*\(\s*true|\.commit\s*\(\s*\)|\.rollback\s*\(\s*\))	7	high	none: use the outbox for publish-with-database; consume is at-least-once with the idempotent consumer	XA has no equivalent.
+jms-durable-subscriber	jms	usage	\b(createDurableSubscriber|createDurableConsumer|createSharedDurableConsumer)\b	4	medium	a durable queue bound to the topic exchange, consumed with mq.consume
+jms-temporary	jms	usage	\b(createTemporaryQueue|createTemporaryTopic|setJMSReplyTo)\b	6	medium	mq.requester() (direct reply-to)
+jms-priority-ttl	jms	usage	\b(setPriority|setTimeToLive|setDeliveryDelay)\s*\(	3	medium	queue arguments for priority and TTL; Scheduler for a delivery delay
